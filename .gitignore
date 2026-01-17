@@ -46,3 +46,13 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+.python_packages
+
+# ------------------------------
+# Azurite local emulator data
+# ------------------------------
+AzuriteConfig/
+__azurite_db_*.json
+__blobstorage__/
+__queuestorage__/

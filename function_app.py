@@ -8,84 +8,66 @@ from azure.keyvault.secrets import SecretClient
 from azure.storage.blob import BlobServiceClient
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
+from azure.core.serialization import as_attribute_dict
 
 
 app = func.FunctionApp()
 
+# App settings (set locally in local.settings.json and in Azure Function App Configuration)
+DOC_INTEL_ENDPOINT = os.environ["DOCUMENT_INTELLIGENCE_ENDPOINT"]
+DOC_INTEL_KEY = os.environ["DOCUMENT_INTELLIGENCE_KEY"]
+OUTPUT_CONTAINER = os.environ.get("OUTPUT_CONTAINER", "output")
 
-def _env(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise ValueError(f"Missing env var: {name}")
-    return v
+# Clients are created once per worker for efficiency
+doc_client = DocumentIntelligenceClient(
+    endpoint=DOC_INTEL_ENDPOINT,
+    credential=AzureKeyCredential(DOC_INTEL_KEY),
+)
 
+@app.blob_trigger(
+    arg_name="inblob",
+    path="raw/{name}",
+    connection="AzureWebJobsStorage",
+)
+def receipt_extract_to_json(inblob: func.InputStream):
+    """
+    Trigger: fires when a blob is created/updated in raw/
+    Action: sends bytes to Document Intelligence prebuilt-receipt
+    Output: writes JSON result to output/{name}.receipt.json
+    """
+    blob_name = inblob.name  # includes container path like "raw/xyz.jpg" depending on runtime
+    logging.info(f"Triggered by blob: {blob_name}, Size: {inblob.length} bytes")
 
-def _parse_subject(subject: str) -> tuple[str, str]:
-    # subject: /blobServices/default/containers/raw/blobs/file.jpg
-    parts = subject.split("/")
-    container = parts[parts.index("containers") + 1]
-    blob_name = "/".join(parts[parts.index("blobs") + 1:])
-    return container, blob_name
+    # Read the uploaded file bytes
+    receipt_bytes = inblob.read()
 
+    # Analyze with prebuilt receipt model (Document Intelligence)
+    poller = doc_client.begin_analyze_document(
+        model_id="prebuilt-receipt",
+        body=receipt_bytes,
+    )
+    result = poller.result()
 
-@app.function_name(name="lem-travel-receipts")
-@app.route(route="receipt-ocr", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
-def receipt_ocr(req: func.HttpRequest) -> func.HttpResponse:
-    # Event Grid sends an array of events
-    try:
-        events = req.get_json()
-        if isinstance(events, dict):
-            events = [events]
-    except Exception:
-        return func.HttpResponse("Invalid JSON", status_code=400)
+    # Convert result to a JSON-serializable dict
+    # (Document Intelligence SDK objects expose to_dict() in current SDKs)
+    result_dict = as_attribute_dict(result)
 
-    # 1) Handle Event Grid subscription validation handshake
-    for e in events:
-        if e.get("eventType") == "Microsoft.EventGrid.SubscriptionValidationEvent":
-            code = e["data"]["validationCode"]
-            return func.HttpResponse(
-                json.dumps({"validationResponse": code}),
-                mimetype="application/json",
-                status_code=200,
-            )
+    # Decide output name
+    # inblob.name may include "raw/". We'll normalize.
+    base_name = blob_name.split("/")[-1]
+    out_name = f"{base_name}.receipt.json"
 
-    credential = DefaultAzureCredential()
+    # Write to output container
+    blob_service = BlobServiceClient.from_connection_string(
+        os.environ["AZURITE_BLOB_CONNECTION_STRING"]
+    )
+    out_blob = blob_service.get_blob_client(container=OUTPUT_CONTAINER, blob=out_name)
+    logging.info(f"Upload target URL: {out_blob.url}")
 
-    # 2) Read Doc Intelligence secrets from Key Vault
-    kv = SecretClient(vault_url=_env("KEYVAULT_URL"), credential=credential)
-    docint_endpoint = kv.get_secret("docint-endpoint").value
-    docint_key = kv.get_secret("docint-key").value
+    out_blob.upload_blob(
+        json.dumps(result_dict, ensure_ascii=False, indent=2).encode("utf-8"),
+        overwrite=True,
+        content_type="application/json",
+    )
 
-    # 3) Connect to Blob using Managed Identity
-    blob_service = BlobServiceClient(account_url=_env("STORAGE_ACCOUNT_URL"), credential=credential)
-    raw_container_expected = _env("RAW_CONTAINER")
-
-    processed = 0
-
-    for e in events:
-        if e.get("eventType") not in ("Microsoft.Storage.BlobCreated", "BlobCreated"):
-            continue
-
-        container, blob_name = _parse_subject(e.get("subject", ""))
-
-        if container != raw_container_expected:
-            logging.info(f"Skipping container={container} blob={blob_name}")
-            continue
-
-        logging.info(f"OCR receipt: {container}/{blob_name}")
-
-        # Download the image bytes
-        blob = blob_service.get_container_client(container).get_blob_client(blob_name)
-        image_bytes = blob.download_blob().readall()
-
-        # Analyze with prebuilt receipt model
-        di = DocumentIntelligenceClient(docint_endpoint, AzureKeyCredential(docint_key))
-        poller = di.begin_analyze_document(model_id="prebuilt-receipt", body=image_bytes)
-        result = poller.result().as_dict()
-
-        # For now, just log the result (you can store it later)
-        logging.info(json.dumps(result, ensure_ascii=False)[:3000])
-
-        processed += 1
-
-    return func.HttpResponse(f"OK. OCR processed {processed} receipt(s).", status_code=200)
+    logging.info(f"Wrote receipt JSON to: {OUTPUT_CONTAINER}/{out_name}")
