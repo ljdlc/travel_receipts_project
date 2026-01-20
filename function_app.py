@@ -59,7 +59,7 @@ def receipt_extract_to_json(inblob: func.InputStream):
 
     # Write to output container
     blob_service = BlobServiceClient.from_connection_string(
-        os.environ["AZURITE_BLOB_CONNECTION_STRING"]
+        os.environ["AzureWebJobsStorage"]
     )
     out_blob = blob_service.get_blob_client(container=OUTPUT_CONTAINER, blob=out_name)
     logging.info(f"Upload target URL: {out_blob.url}")
